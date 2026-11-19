@@ -10,13 +10,21 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import torch
 
+from deepflow import _xla
 from deepflow.deepflow import _PyramidSolver
 from deepflow.io import validate_pyramid_settings
 from deepflow.matching import deep_match, resample_matches
 from deepflow.ops import resize_bilinear
 from deepflow.variational import variational_refine
+
+
+def _reject_xla() -> None:
+    # DeepMatching depends on conv2d precision (TPUs default to bfloat16 passes)
+    # and on scatter_reduce tie-breaking; neither is validated on XLA yet.
+    raise ValueError("DeepFlowICCV does not support TPU/XLA yet; use DeepFlow")
 
 
 class DeepFlowICCV(_PyramidSolver):
@@ -74,7 +82,11 @@ class DeepFlowICCV(_PyramidSolver):
         self.max_layers = int(max_layers)
         self.zeta = float(zeta)
         self.epsilon = float(epsilon)
+        if isinstance(device, str) and device.split(":")[0] == "tpu":
+            _reject_xla()
         self.device = None if device is None else torch.device(device)
+        if _xla.is_xla(self.device):
+            _reject_xla()
         self.beta = float(beta)
         self.beta_exponent = float(beta_exponent)
         self.sigma_m = float(sigma_m)
@@ -84,6 +96,14 @@ class DeepFlowICCV(_PyramidSolver):
         self.descriptor_regularizer = float(descriptor_regularizer)
         self.match_max_side = None if match_max_side is None else int(match_max_side)
         self._init_runtime(cuda_graph, compile)
+
+    def calc(self, i0: Any, i1: Any, flow: Any = None) -> torch.Tensor | np.ndarray:
+        """Estimate flow from ``i0`` to ``i1``. ``flow`` is accepted and ignored."""
+        if self.device is None and any(
+            isinstance(image, torch.Tensor) and _xla.is_xla(image.device) for image in (i0, i1)
+        ):
+            _reject_xla()
+        return super().calc(i0, i1, flow)
 
     def _check_settings(self) -> None:
         validate_pyramid_settings(self)

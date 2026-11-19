@@ -1,6 +1,6 @@
 # deepflow-pytorch
 
-Pure PyTorch optical flow on CPU, NVIDIA CUDA, and Apple Silicon (MPS). There are no custom CUDA or Metal kernels.
+Pure PyTorch optical flow on CPU, NVIDIA CUDA, Apple Silicon (MPS), and Google TPU (through `torch_xla`, `DeepFlow` only). There are no custom CUDA or Metal kernels.
 
 Two entry points share the pyramid and the variational solver:
 
@@ -99,7 +99,7 @@ That iteration count means roughly half a million small kernels per frame. Most 
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `cuda_graph` | `None` (on for CUDA) | The first `calc` for each input shape and setting records the whole pyramid as one CUDA graph; later calls copy the frames in and replay it. Results are identical to eager mode. Each recorded shape keeps its own GPU memory, and the first call costs two to three eager runs (warm-up, capture, replay). Ignored on CPU and MPS. |
+| `cuda_graph` | `None` (on for CUDA) | The first `calc` for each input shape and setting records the whole pyramid as one CUDA graph; later calls copy the frames in and replay it. Results are identical to eager mode. Each recorded shape keeps its own GPU memory, and the first call costs two to three eager runs (warm-up, capture, replay). Ignored on CPU, MPS, and TPU. |
 | `compile` | `False` | Runs each red/black SOR iteration through `torch.compile(dynamic=True)`, which fuses it into a few kernels. Works with `cuda_graph`. The first call compiles (tens of seconds), and fused kernels may round differently from OpenCV by about one ulp. |
 
 ```python
@@ -115,6 +115,27 @@ Batching several pairs into one `(N, 1, H, W)` call is the other lever: the coar
 ```bash
 python benchmarks/bench_deepflow.py --sizes 480p 720p 1080p --batch 1 4
 ```
+
+## TPU (Colab)
+
+`DeepFlow` runs on Google TPUs through `torch_xla`. On Colab, choose a TPU runtime (`torch_xla` is preinstalled there), then install this package with `pip install -e .`. Elsewhere, install `torch_xla[tpu]` at the version matching your `torch`.
+
+```python
+import torch_xla.runtime as xr
+import deepflow
+
+xr.initialize_cache("/content/xla_cache")      # optional: keep XLA compiles across runs; call first
+model = deepflow.DeepFlow(device="tpu", compile=True)   # "xla" works too
+for frame0, frame1 in pairs:
+    flow = model.calc(frame0, frame1)
+```
+
+- XLA records operations and compiles one executable per tensor shape. `DeepFlow` cuts the recording once per pyramid level, so a resolution needs about one compiled graph per level (about 70 at 1080p).
+- Without `compile`, Python re-records every operation on every call, even when the compiled graph is cached. That costs seconds per large frame.
+- `compile=True` uses `torch.compile(backend="openxla")` on each fixed-point step, so later frames skip re-recording. Use it for video. The first frame at each resolution (and batch size) is slow while those graphs are traced and compiled, potentially minutes at 1080p. Later frames reuse them. The persistent cache above saves the XLA compile part across sessions; the tracing still happens once per process.
+- Results match the CPU within a small tolerance, not bit for bit: TPU square root and division round differently.
+- `cuda_graph` is ignored on TPU. `DeepFlowICCV` does not support TPU yet. DeepMatching depends on convolution precision (TPUs default to bfloat16 passes for float32 matmuls) and on `scatter_reduce` tie-breaking, which have not been validated there.
+- Benchmark with `python benchmarks/bench_deepflow.py --device tpu --sizes 480p 720p --batch 1 4`, and run `pytest tests/test_tpu.py` to check the setup.
 
 ## ICCV 2013 DeepFlow
 

@@ -250,6 +250,7 @@ def variational_refine(
     beta: float = 0.0,
     masks: tuple[torch.Tensor, torch.Tensor] | None = None,
     sor_step: Callable[..., None] | None = None,
+    fixed_point_step_fn: Callable[..., None] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Refine ``flow_u`` / ``flow_v`` at a single resolution.
 
@@ -266,7 +267,8 @@ def variational_refine(
 
     ``masks`` is an optional precomputed ``checkerboard`` pair for this size.
     ``sor_step`` replaces :func:`sor_iteration` (for example a compiled copy)
-    and must update ``inc`` in place.
+    and must update ``inc`` in place. ``fixed_point_step_fn`` likewise replaces
+    :func:`fixed_point_step` (XLA compiles it so each level traces one step).
     """
     if i0.shape != i1.shape:
         raise ValueError(f"I0 and I1 shapes differ: {tuple(i0.shape)} vs {tuple(i1.shape)}")
@@ -286,31 +288,78 @@ def variational_refine(
 
     n, _, height, width = flow_u.shape
     inc = flow_u.new_zeros((n, 2, height, width))
-    du = inc[:, 0:1]
-    dv = inc[:, 1:2]
     red, black = masks if masks is not None else checkerboard(height, width, i0.device)
-    step = sor_iteration if sor_step is None else sor_step
+    derivatives = (ix, iy, iz, ixx, ixy, iyy, ixz, iyz)
+    fp_step = fixed_point_step if fixed_point_step_fn is None else fixed_point_step_fn
 
     for _ in range(fixed_point_iterations):
-        a11, a12, a22, b1, b2 = _data_term(
-            ix, iy, iz, ixx, ixy, iyy, ixz, iyz, du, dv, delta, gamma, zeta, epsilon
+        fp_step(
+            inc,
+            derivatives,
+            flow_u,
+            flow_v,
+            red,
+            black,
+            alpha=alpha,
+            delta=delta,
+            gamma=gamma,
+            omega=omega,
+            sor_iterations=sor_iterations,
+            zeta=zeta,
+            epsilon=epsilon,
+            match_u=match_u,
+            match_v=match_v,
+            match_weight=match_weight,
+            beta=beta,
+            sor_step=sor_step,
         )
-        weight = _edge_weight(flow_u + du, flow_v + dv, alpha, epsilon)
-        neighbors = _neighbor_weights(weight)
-        a11, a22, b1, b2 = _apply_smoothness(a11, a22, b1, b2, weight, neighbors, flow_u, flow_v)
-        if match_u is not None and beta != 0.0:
-            # Weight uses the current flow W + dW. The linear pull is toward the
-            # match from the incoming flow W, same fixed-point split as color.
-            diff_u = flow_u + du - match_u
-            diff_v = flow_v + dv - match_v
-            rho = (beta * 0.5) * match_weight / torch.sqrt(
-                diff_u * diff_u + diff_v * diff_v + epsilon * epsilon
-            )
-            a11 = a11 + rho
-            a22 = a22 + rho
-            b1 = b1 + rho * (match_u - flow_u)
-            b2 = b2 + rho * (match_v - flow_v)
-        for _ in range(sor_iterations):
-            step(inc, neighbors, a11, a12, a22, b1, b2, omega, red, black)
 
-    return flow_u + du, flow_v + dv
+    return flow_u + inc[:, 0:1], flow_v + inc[:, 1:2]
+
+
+def fixed_point_step(
+    inc: torch.Tensor,
+    derivatives: tuple[torch.Tensor, ...],
+    flow_u: torch.Tensor,
+    flow_v: torch.Tensor,
+    red: torch.Tensor,
+    black: torch.Tensor,
+    *,
+    alpha: float,
+    delta: float,
+    gamma: float,
+    omega: float,
+    sor_iterations: int,
+    zeta: float,
+    epsilon: float,
+    match_u: torch.Tensor | None = None,
+    match_v: torch.Tensor | None = None,
+    match_weight: torch.Tensor | None = None,
+    beta: float = 0.0,
+    sor_step: Callable[..., None] | None = None,
+) -> None:
+    """One fixed-point iteration: rebuild the linear system, then run SOR on ``inc`` in place."""
+    ix, iy, iz, ixx, ixy, iyy, ixz, iyz = derivatives
+    du = inc[:, 0:1]
+    dv = inc[:, 1:2]
+    a11, a12, a22, b1, b2 = _data_term(
+        ix, iy, iz, ixx, ixy, iyy, ixz, iyz, du, dv, delta, gamma, zeta, epsilon
+    )
+    weight = _edge_weight(flow_u + du, flow_v + dv, alpha, epsilon)
+    neighbors = _neighbor_weights(weight)
+    a11, a22, b1, b2 = _apply_smoothness(a11, a22, b1, b2, weight, neighbors, flow_u, flow_v)
+    if match_u is not None and beta != 0.0:
+        # Weight uses the current flow W + dW. The linear pull is toward the
+        # match from the incoming flow W, same fixed-point split as color.
+        diff_u = flow_u + du - match_u
+        diff_v = flow_v + dv - match_v
+        rho = (beta * 0.5) * match_weight / torch.sqrt(
+            diff_u * diff_u + diff_v * diff_v + epsilon * epsilon
+        )
+        a11 = a11 + rho
+        a22 = a22 + rho
+        b1 = b1 + rho * (match_u - flow_u)
+        b2 = b2 + rho * (match_v - flow_v)
+    step = sor_iteration if sor_step is None else sor_step
+    for _ in range(sor_iterations):
+        step(inc, neighbors, a11, a12, a22, b1, b2, omega, red, black)

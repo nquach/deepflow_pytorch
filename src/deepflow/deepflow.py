@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import math
 import warnings
 from dataclasses import dataclass
@@ -10,9 +12,15 @@ from typing import Any, Callable
 import numpy as np
 import torch
 
-from deepflow.io import format_flow, prepare_pair, validate_pyramid_settings
+from deepflow import _xla
+from deepflow.io import format_flow, prepare_pair, resolve_device, validate_pyramid_settings
 from deepflow.ops import gaussian_blur, resize_bilinear
-from deepflow.variational import checkerboard, sor_iteration_functional, variational_refine
+from deepflow.variational import (
+    checkerboard,
+    fixed_point_step,
+    sor_iteration_functional,
+    variational_refine,
+)
 
 
 def pyramid_sizes(
@@ -78,6 +86,88 @@ def _compiled_sor_iteration() -> Callable[..., None]:
         # dynamic=True: one compiled graph serves every pyramid level size.
         _COMPILED_SOR = torch.compile(sor_iteration_functional, dynamic=True, fullgraph=True)
     return _COMPILED_SOR
+
+
+def _deepflow_level(
+    i0: torch.Tensor,
+    i1: torch.Tensor,
+    flow_u: torch.Tensor,
+    flow_v: torch.Tensor,
+    red: torch.Tensor,
+    black: torch.Tensor,
+    *,
+    alpha: float,
+    delta: float,
+    gamma: float,
+    omega: float,
+    fixed_point_iterations: int,
+    sor_iterations: int,
+    zeta: float,
+    epsilon: float,
+    sor_step: Callable[..., None] | None = None,
+    fixed_point_step_fn: Callable[..., None] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Refine one pyramid level (no upsampling)."""
+    return variational_refine(
+        i0,
+        i1,
+        flow_u,
+        flow_v,
+        alpha=alpha,
+        delta=delta,
+        gamma=gamma,
+        omega=omega,
+        fixed_point_iterations=fixed_point_iterations,
+        sor_iterations=sor_iterations,
+        zeta=zeta,
+        epsilon=epsilon,
+        masks=(red, black),
+        sor_step=sor_step,
+        fixed_point_step_fn=fixed_point_step_fn,
+    )
+
+
+def _deepflow_level_functional(*args: Any, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`_deepflow_level` with the out-of-place SOR step, which XLA traces cleanly."""
+    return _deepflow_level(*args, sor_step=sor_iteration_functional, **kwargs)
+
+
+def _fixed_point_step_functional(*args: Any, **kwargs: Any) -> None:
+    return fixed_point_step(*args, sor_step=sor_iteration_functional, **kwargs)
+
+
+_XLA_COMPILED_STEP: Callable[..., None] | None = None
+
+
+def _xla_compiled_level(*args: Any, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`_deepflow_level_functional` with each fixed-point step run through openxla.
+
+    The compiled unit is one fixed-point step (25 SOR iterations), not a whole
+    level: a level reuses it ``fixed_point_iterations`` times with the same
+    shapes, so Dynamo traces a fifth as many ops. Static shapes, so XLA builds
+    one executable per level size and later frames replay it without retracing.
+    """
+    global _XLA_COMPILED_STEP
+    if _XLA_COMPILED_STEP is None:
+        _XLA_COMPILED_STEP = torch.compile(_fixed_point_step_functional, backend="openxla", dynamic=False)
+    return _deepflow_level_functional(*args, fixed_point_step_fn=_XLA_COMPILED_STEP, **kwargs)
+
+
+_RECOMPILE_LIMIT = 2048
+
+
+def _xla_recompile_headroom() -> contextlib.AbstractContextManager[Any]:
+    """Raise Dynamo's per-function recompile limit while the level loop runs.
+
+    Every pyramid level size is a separate entry (about 70 per resolution), well
+    above the default limit of 8. Names differ across torch releases.
+    """
+    import torch._dynamo
+
+    config = torch._dynamo.config
+    names = ("recompile_limit", "cache_size_limit", "accumulated_recompile_limit", "accumulated_cache_size_limit")
+    changes = {name: _RECOMPILE_LIMIT for name in names if hasattr(config, name)}
+    return config.patch(**changes)
 
 
 class _PyramidSolver:
@@ -250,7 +340,7 @@ class DeepFlow(_PyramidSolver):
         self.max_layers = int(max_layers)
         self.zeta = float(zeta)
         self.epsilon = float(epsilon)
-        self.device = None if device is None else torch.device(device)
+        self.device = resolve_device(device)
         self._init_runtime(cuda_graph, compile)
 
     def _check_settings(self) -> None:
@@ -284,29 +374,37 @@ class DeepFlow(_PyramidSolver):
         alpha = 4.0 * self.alpha
         delta = self.delta / 3.0
         gamma = self.gamma / 3.0
-        sor_step = self._sor_step()
+        params = dict(
+            alpha=alpha,
+            delta=delta,
+            gamma=gamma,
+            omega=self.omega,
+            fixed_point_iterations=self.fixed_point_iterations,
+            sor_iterations=self.sor_iterations,
+            zeta=self.zeta,
+            epsilon=self.epsilon,
+        )
+        on_xla = _xla.is_xla(i0.device)
+        if on_xla and self.compile:
+            level_fn = _xla_compiled_level
+        elif on_xla:
+            level_fn = _deepflow_level_functional
+        else:
+            level_fn = functools.partial(_deepflow_level, sor_step=self._sor_step())
 
-        for index in range(len(pyramid) - 1, -1, -1):
-            flow_u, flow_v = variational_refine(
-                pyramid[index][:n],
-                pyramid[index][n:],
-                flow_u,
-                flow_v,
-                alpha=alpha,
-                delta=delta,
-                gamma=gamma,
-                omega=self.omega,
-                fixed_point_iterations=self.fixed_point_iterations,
-                sor_iterations=self.sor_iterations,
-                zeta=self.zeta,
-                epsilon=self.epsilon,
-                masks=plan.masks[index],
-                sor_step=sor_step,
-            )
-            if index > 0:
-                next_size = plan.sizes[index - 1]
-                flow_u = resize_bilinear(flow_u, next_size) * scale
-                flow_v = resize_bilinear(flow_v, next_size) * scale
+        with _xla_recompile_headroom() if on_xla and self.compile else contextlib.nullcontext():
+            for index in range(len(pyramid) - 1, -1, -1):
+                red, black = plan.masks[index]
+                flow_u, flow_v = level_fn(
+                    pyramid[index][:n], pyramid[index][n:], flow_u, flow_v, red, black, **params
+                )
+                if index > 0:
+                    next_size = plan.sizes[index - 1]
+                    flow_u = resize_bilinear(flow_u, next_size) * scale
+                    flow_v = resize_bilinear(flow_v, next_size) * scale
+                if on_xla:
+                    # One lazy graph per level, cached by shape, instead of one for the whole frame.
+                    _xla.sync()
 
         return torch.cat([flow_u, flow_v], dim=1)
 

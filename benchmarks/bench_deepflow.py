@@ -2,9 +2,10 @@
 
     python benchmarks/bench_deepflow.py --sizes 480p 720p 1080p --batch 1 4
 
-Reports the median seconds per frame pair after warm-up. CUDA timings
+Reports the median seconds per frame pair after warm-up. CUDA and TPU timings
 synchronize before reading the clock. The first call for each shape (graph
-capture, compilation) is excluded.
+capture, compilation) is excluded. On TPU (``--device tpu``) the variants are
+the lazy path and ``compile=True`` (openxla).
 """
 
 from __future__ import annotations
@@ -17,6 +18,8 @@ import numpy as np
 import torch
 
 import deepflow
+from deepflow import _xla
+from deepflow.io import resolve_device
 
 SIZES = {"240p": (240, 320), "480p": (480, 640), "720p": (720, 1280), "1080p": (1080, 1920)}
 
@@ -33,17 +36,23 @@ def _pair(height: int, width: int, batch: int, seed: int = 0) -> tuple[np.ndarra
     return np.stack(frames0), np.stack(frames1)
 
 
-def _time(fn, repeats: int, sync: bool) -> float:
+def _time(fn, repeats: int, sync=None) -> float:
     samples = []
     for _ in range(repeats):
-        if sync:
-            torch.cuda.synchronize()
+        if sync is not None:
+            sync()
         start = time.perf_counter()
         fn()
-        if sync:
-            torch.cuda.synchronize()
+        if sync is not None:
+            sync()
         samples.append(time.perf_counter() - start)
     return statistics.median(samples)
+
+
+def _xla_sync() -> None:
+    # Launch anything still recorded (the final concat), then wait for the TPU.
+    _xla.sync()
+    _xla.wait()
 
 
 def main() -> None:
@@ -51,14 +60,18 @@ def main() -> None:
     parser.add_argument("--sizes", nargs="+", default=["480p", "720p", "1080p"], choices=sorted(SIZES))
     parser.add_argument("--batch", nargs="+", type=int, default=[1, 4])
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--device", default="cuda" if torch.cuda.is_available() else "cpu", help="cpu, cuda, mps, or tpu"
+    )
     parser.add_argument("--no-opencv", action="store_true")
     parser.add_argument("--no-compile", action="store_true", help="skip the torch.compile variant")
     args = parser.parse_args()
 
-    device = torch.device(args.device)
+    device = resolve_device(args.device)
     on_cuda = device.type == "cuda"
-    variants: dict[str, dict] = {"eager": dict(cuda_graph=False)}
+    on_xla = _xla.is_xla(device)
+    sync = torch.cuda.synchronize if on_cuda else _xla_sync if on_xla else None
+    variants: dict[str, dict] = {"lazy" if on_xla else "eager": dict(cuda_graph=False)}
     if on_cuda:
         variants["cuda_graph"] = dict(cuda_graph=True)
         if not args.no_compile:
@@ -88,13 +101,13 @@ def main() -> None:
                     for a, b in zip(frames0, frames1):
                         solver.calc(a, b, None)
 
-                row.append(f"{_time(run_cv, args.repeats, False) / batch:>20.3f}")
+                row.append(f"{_time(run_cv, args.repeats) / batch:>20.3f}")
             t0 = torch.from_numpy(frames0)[:, None].to(device)
             t1 = torch.from_numpy(frames1)[:, None].to(device)
             for options in variants.values():
                 model = deepflow.DeepFlow(device=device, **options)
                 model.calc(t0, t1)  # capture / compile / cache warm-up
-                seconds = _time(lambda: model.calc(t0, t1), args.repeats, on_cuda)
+                seconds = _time(lambda: model.calc(t0, t1), args.repeats, sync)
                 row.append(f"{seconds / batch:>20.3f}")
                 del model
                 if on_cuda:

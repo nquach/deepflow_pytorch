@@ -7,6 +7,22 @@ from typing import Any
 import numpy as np
 import torch
 
+from deepflow._xla import xla_device
+
+
+def resolve_device(device: str | torch.device | None) -> torch.device | None:
+    """``torch.device`` for a user-supplied device. ``"tpu"`` and ``"xla"`` mean the torch_xla device."""
+    if device is None:
+        return None
+    if isinstance(device, str) and device.split(":")[0] == "tpu":
+        device = "xla" + device[3:]
+    device = torch.device(device)
+    if device.type != "xla":
+        return device
+    # Always go through torch_xla so it is imported before tensors move there.
+    default = xla_device()
+    return default if device.index is None else device
+
 
 def is_numpy(value: Any) -> bool:
     return isinstance(value, np.ndarray)
