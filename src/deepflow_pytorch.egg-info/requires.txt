@@ -1,0 +1,6 @@
+numpy
+torch
+
+[test]
+opencv-contrib-python
+pytest
