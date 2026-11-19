@@ -3,14 +3,35 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+import warnings
+from dataclasses import dataclass
+from typing import Any, Callable
 
 import numpy as np
 import torch
 
 from deepflow.io import format_flow, prepare_pair, validate_pyramid_settings
 from deepflow.ops import gaussian_blur, resize_bilinear
-from deepflow.variational import variational_refine
+from deepflow.variational import checkerboard, sor_iteration, variational_refine
+
+
+def pyramid_sizes(
+    height: int,
+    width: int,
+    downscale_factor: float,
+    min_size: int,
+    max_layers: int,
+) -> list[tuple[int, int]]:
+    """``(height, width)`` of every level of :func:`build_pyramid`, finest first."""
+    sizes = [(height, width)]
+    for _ in range(max_layers):
+        prev_h, prev_w = sizes[-1]
+        next_h = int(math.floor(prev_h * downscale_factor + 0.5))
+        next_w = int(math.floor(prev_w * downscale_factor + 0.5))
+        if next_h <= min_size or next_w <= min_size:
+            break
+        sizes.append((next_h, next_w))
+    return sizes
 
 
 def build_pyramid(
@@ -25,17 +46,38 @@ def build_pyramid(
     loop stops when either side would be ``<= min_size``, and never exceeds
     ``max_layers`` extra resizes. Images are not blurred again between levels.
     """
+    height, width = image.shape[-2:]
     levels = [image]
-    prev = image
-    for _ in range(max_layers):
-        height, width = prev.shape[-2:]
-        next_h = int(math.floor(height * downscale_factor + 0.5))
-        next_w = int(math.floor(width * downscale_factor + 0.5))
-        if next_h <= min_size or next_w <= min_size:
-            break
-        prev = resize_bilinear(prev, (next_h, next_w))
-        levels.append(prev)
+    for size in pyramid_sizes(height, width, downscale_factor, min_size, max_layers)[1:]:
+        levels.append(resize_bilinear(levels[-1], size))
     return levels
+
+
+@dataclass
+class _Plan:
+    """Per-size constants, built once so ``_estimate`` does no host-to-device copy."""
+
+    sizes: list[tuple[int, int]]
+    masks: list[tuple[torch.Tensor, torch.Tensor]]
+
+
+@dataclass
+class _GraphEntry:
+    graph: torch.cuda.CUDAGraph
+    static_i0: torch.Tensor
+    static_i1: torch.Tensor
+    static_flow: torch.Tensor
+
+
+_COMPILED_SOR: Callable[..., None] | None = None
+
+
+def _compiled_sor_iteration() -> Callable[..., None]:
+    global _COMPILED_SOR
+    if _COMPILED_SOR is None:
+        # dynamic=True: one compiled graph serves every pyramid level size.
+        _COMPILED_SOR = torch.compile(sor_iteration, dynamic=True, fullgraph=True)
+    return _COMPILED_SOR
 
 
 class DeepFlow:
@@ -60,6 +102,14 @@ class DeepFlow:
     A batch must share one spatial size. ``uint8`` is converted with
     ``float(value)``, not ``value / 255``. ``zeta`` and ``epsilon`` are absolute,
     so a ``[0, 1]`` float image is a different problem than an 8-bit image.
+
+    Speed options (results are unchanged unless noted):
+
+    - ``cuda_graph``: on CUDA, the first call for each input shape records the
+      whole pyramid as one CUDA graph; later calls replay it. ``None`` (default)
+      enables it on CUDA devices. Each recorded shape keeps its own GPU memory.
+    - ``compile``: run the SOR iteration through ``torch.compile``. The first
+      call is slow, and fused kernels may round differently by about one ulp.
     """
 
     def __init__(
@@ -77,6 +127,8 @@ class DeepFlow:
         zeta: float = 0.1,
         epsilon: float = 0.001,
         device: str | torch.device | None = None,
+        cuda_graph: bool | None = None,
+        compile: bool = False,
     ) -> None:
         self.sigma = float(sigma)
         self.min_size = int(min_size)
@@ -91,6 +143,11 @@ class DeepFlow:
         self.zeta = float(zeta)
         self.epsilon = float(epsilon)
         self.device = None if device is None else torch.device(device)
+        self.cuda_graph = cuda_graph
+        self.compile = bool(compile)
+        self._plans: dict[tuple[Any, ...], _Plan] = {}
+        self._graphs: dict[tuple[Any, ...], _GraphEntry] = {}
+        self._graph_failed = False
 
     def calc(self, i0: Any, i1: Any, flow: Any = None) -> torch.Tensor | np.ndarray:
         """Estimate flow from ``i0`` to ``i1``. ``flow`` is accepted and ignored."""
@@ -98,29 +155,69 @@ class DeepFlow:
         self._check_settings()
         left, right, layout, as_numpy = prepare_pair(i0, i1, self.device)
         with torch.no_grad():
-            flow_nchw = self._estimate(left, right)
+            if self._use_graph(left.device):
+                flow_nchw = self._estimate_graph(left, right)
+            else:
+                flow_nchw = self._estimate(left, right)
         return format_flow(flow_nchw, layout, as_numpy)
 
     def _check_settings(self) -> None:
         validate_pyramid_settings(self)
 
+    def _settings(self) -> tuple[Any, ...]:
+        return (
+            self.sigma,
+            self.min_size,
+            self.downscale_factor,
+            self.fixed_point_iterations,
+            self.sor_iterations,
+            self.alpha,
+            self.delta,
+            self.gamma,
+            self.omega,
+            self.max_layers,
+            self.zeta,
+            self.epsilon,
+            self.compile,
+        )
+
+    def _use_graph(self, device: torch.device) -> bool:
+        if device.type != "cuda" or self._graph_failed:
+            return False
+        return self.cuda_graph is None or bool(self.cuda_graph)
+
+    def _plan(self, height: int, width: int, device: torch.device) -> _Plan:
+        key = (height, width, device, self.downscale_factor, self.min_size, self.max_layers)
+        plan = self._plans.get(key)
+        if plan is None:
+            sizes = pyramid_sizes(height, width, self.downscale_factor, self.min_size, self.max_layers)
+            masks = [checkerboard(h, w, device) for h, w in sizes]
+            plan = _Plan(sizes, masks)
+            self._plans[key] = plan
+        return plan
+
     def _estimate(self, i0: torch.Tensor, i1: torch.Tensor) -> torch.Tensor:
-        i0 = gaussian_blur(i0, self.sigma)
-        i1 = gaussian_blur(i1, self.sigma)
-        pyramid0 = build_pyramid(i0, self.downscale_factor, self.min_size, self.max_layers)
-        pyramid1 = build_pyramid(i1, self.downscale_factor, self.min_size, self.max_layers)
-        coarsest = pyramid0[-1]
+        n = i0.shape[0]
+        plan = self._plan(i0.shape[-2], i0.shape[-1], i0.device)
+        # Both frames share one blur and one resize per level.
+        level = gaussian_blur(torch.cat([i0, i1], dim=0), self.sigma)
+        pyramid = [level]
+        for size in plan.sizes[1:]:
+            level = resize_bilinear(level, size)
+            pyramid.append(level)
+        coarsest = pyramid[-1][:n]
         flow_u = torch.zeros_like(coarsest)
         flow_v = torch.zeros_like(coarsest)
         scale = 1.0 / self.downscale_factor
         alpha = 4.0 * self.alpha
         delta = self.delta / 3.0
         gamma = self.gamma / 3.0
+        sor_step = _compiled_sor_iteration() if self.compile else None
 
-        for level in range(len(pyramid0) - 1, -1, -1):
+        for index in range(len(pyramid) - 1, -1, -1):
             flow_u, flow_v = variational_refine(
-                pyramid0[level],
-                pyramid1[level],
+                pyramid[index][:n],
+                pyramid[index][n:],
                 flow_u,
                 flow_v,
                 alpha=alpha,
@@ -131,13 +228,51 @@ class DeepFlow:
                 sor_iterations=self.sor_iterations,
                 zeta=self.zeta,
                 epsilon=self.epsilon,
+                masks=plan.masks[index],
+                sor_step=sor_step,
             )
-            if level > 0:
-                next_size = pyramid0[level - 1].shape[-2:]
+            if index > 0:
+                next_size = plan.sizes[index - 1]
                 flow_u = resize_bilinear(flow_u, next_size) * scale
                 flow_v = resize_bilinear(flow_v, next_size) * scale
 
         return torch.cat([flow_u, flow_v], dim=1)
+
+    def _estimate_graph(self, i0: torch.Tensor, i1: torch.Tensor) -> torch.Tensor:
+        key = (tuple(i0.shape), i0.device, self._settings())
+        entry = self._graphs.get(key)
+        if entry is None:
+            try:
+                entry = self._capture(i0, i1)
+            except Exception as error:  # noqa: BLE001 - any capture failure falls back
+                self._graph_failed = True
+                warnings.warn(
+                    f"CUDA graph capture failed ({error}); DeepFlow falls back to eager mode.",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+                return self._estimate(i0, i1)
+            self._graphs[key] = entry
+        else:
+            entry.static_i0.copy_(i0)
+            entry.static_i1.copy_(i1)
+        entry.graph.replay()
+        return entry.static_flow.clone()
+
+    def _capture(self, i0: torch.Tensor, i1: torch.Tensor) -> _GraphEntry:
+        static_i0 = i0.clone()
+        static_i1 = i1.clone()
+        # Warm up on a side stream: fills the per-shape caches (and compiles, if
+        # enabled) so nothing inside the capture allocates on or copies from the host.
+        side = torch.cuda.Stream(device=i0.device)
+        side.wait_stream(torch.cuda.current_stream(i0.device))
+        with torch.cuda.stream(side):
+            self._estimate(static_i0, static_i1)
+        torch.cuda.current_stream(i0.device).wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_flow = self._estimate(static_i0, static_i1)
+        return _GraphEntry(graph, static_i0, static_i1, static_flow)
 
 
 def create_opt_flow_deep_flow(**kwargs: Any) -> DeepFlow:

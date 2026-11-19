@@ -93,6 +93,27 @@ The pyramid is built by blurring once, then repeatedly resizing with bilinear in
 
 At the default scale of 0.95 a 1080p pair has on the order of 70 levels, and each level runs 5×25 SOR iterations. The implementation is a small number of dense tensor ops per iteration so it can use the GPU, but that iteration count is part of matching OpenCV.
 
+## Performance
+
+That iteration count means roughly half a million small kernels per frame. Most levels are tiny, so in plain eager mode a GPU spends its time on launch overhead rather than arithmetic. Two constructor options address that:
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `cuda_graph` | `None` (on for CUDA) | The first `calc` for each input shape and setting records the whole pyramid as one CUDA graph; later calls copy the frames in and replay it. Results are identical to eager mode. Each recorded shape keeps its own GPU memory, and the first call costs two to three eager runs (warm-up, capture, replay). Ignored on CPU and MPS. |
+| `compile` | `False` | Runs each red/black SOR iteration through `torch.compile(dynamic=True)`, which fuses it into a few kernels. Works with `cuda_graph`. The first call compiles (tens of seconds), and fused kernels may round differently from OpenCV by about one ulp. |
+
+```python
+model = deepflow.DeepFlow(device="cuda", compile=True)  # cuda_graph is on by default
+for frame0, frame1 in pairs:          # same resolution: captured once, replayed after
+    flow = model.calc(frame0, frame1)
+```
+
+Batching several pairs into one `(N, 1, H, W)` call is the other lever: the coarse levels are too small to fill a GPU with a single pair. Time your setup with:
+
+```bash
+python benchmarks/bench_deepflow.py --sizes 480p 720p 1080p --batch 1 4
+```
+
 ## ICCV 2013 DeepFlow
 
 `DeepFlowICCV` takes the same fields and defaults as `DeepFlow`, and `calc` accepts the same grayscale layouts. It does **not** apply OpenCV's `4 * alpha`, `delta / 3`, and `gamma / 3` rescaling. The values you pass are the weights in the paper's energy.

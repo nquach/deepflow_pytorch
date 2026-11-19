@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import functools
 import math
 
 import torch
+import torch.nn.functional as F
 
 
 def gaussian_kernel_size(sigma: float) -> int:
@@ -41,8 +43,40 @@ def _replicate(index: torch.Tensor, length: int) -> torch.Tensor:
     return index.clamp(0, length - 1)
 
 
+@functools.lru_cache(maxsize=64)
+def _gaussian_taps(ksize: int, sigma: float) -> tuple[float, ...]:
+    """float32 Gaussian weights as Python floats, so filtering needs no device copy."""
+    return tuple(float(w) for w in gaussian_kernel(ksize, sigma, dtype=torch.float32, device=torch.device("cpu")))
+
+
+def _pad_axis(image: torch.Tensor, radius: int, *, axis: int, border: str) -> torch.Tensor:
+    pad = (radius, radius, 0, 0) if axis == 3 else (0, 0, radius, radius)
+    if border == "reflect101":
+        return F.pad(image, pad, mode="reflect")
+    if border == "replicate":
+        return F.pad(image, pad, mode="replicate")
+    raise ValueError(f"unknown border {border}")
+
+
+def _correlate_taps(image: torch.Tensor, taps: tuple[float, ...], *, axis: int, border: str) -> torch.Tensor:
+    """Separable correlation with scalar taps, accumulated in tap order."""
+    if axis not in (2, 3):
+        raise ValueError("axis must be 2 (vertical) or 3 (horizontal)")
+    length = image.shape[axis]
+    radius = len(taps) // 2
+    if border == "reflect101" and length <= radius:
+        # F.pad's reflect needs the pad to be shorter than the axis.
+        kernel = torch.tensor(taps, dtype=image.dtype, device=image.device)
+        return _correlate_axis(image, kernel, axis=axis, border=border)
+    padded = _pad_axis(image, radius, axis=axis, border=border)
+    total = padded.narrow(axis, 0, length) * taps[0]
+    for index in range(1, len(taps)):
+        total = total + padded.narrow(axis, index, length) * taps[index]
+    return total
+
+
 def _correlate_axis(image: torch.Tensor, kernel: torch.Tensor, *, axis: int, border: str) -> torch.Tensor:
-    """Separable correlation along height (axis=2) or width (axis=3)."""
+    """Separable correlation along height (axis=2) or width (axis=3), by gathering."""
     if axis not in (2, 3):
         raise ValueError("axis must be 2 (vertical) or 3 (horizontal)")
     length = image.shape[axis]
@@ -74,9 +108,9 @@ def gaussian_blur(image: torch.Tensor, sigma: float) -> torch.Tensor:
     ksize = gaussian_kernel_size(sigma)
     if ksize <= 1:
         return image
-    kernel = gaussian_kernel(ksize, sigma, dtype=image.dtype, device=image.device)
-    blurred = _correlate_axis(image, kernel, axis=3, border="reflect101")
-    return _correlate_axis(blurred, kernel, axis=2, border="reflect101")
+    taps = _gaussian_taps(ksize, float(sigma))
+    blurred = _correlate_taps(image, taps, axis=3, border="reflect101")
+    return _correlate_taps(blurred, taps, axis=2, border="reflect101")
 
 
 def _central_difference(image: torch.Tensor, *, axis: int) -> torch.Tensor:
@@ -84,8 +118,9 @@ def _central_difference(image: torch.Tensor, *, axis: int) -> torch.Tensor:
 
     The ksize-1 kernel is the unnormalized central difference ``[-1, 0, 1]``.
     """
-    kernel = image.new_tensor([-1.0, 0.0, 1.0])
-    return _correlate_axis(image, kernel, axis=axis, border="replicate")
+    length = image.shape[axis]
+    padded = _pad_axis(image, 1, axis=axis, border="replicate")
+    return padded.narrow(axis, 2, length) - padded.narrow(axis, 0, length)
 
 
 def sobel_x(image: torch.Tensor) -> torch.Tensor:
@@ -154,18 +189,27 @@ def resize_bilinear(image: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
     if out_h == in_h and out_w == in_w:
         return image
 
-    device = image.device
-    inv_x = float(in_w) / float(out_w)
-    inv_y = float(in_h) / float(out_h)
-    # Coordinates are built in float64 on CPU. MPS has no float64, and OpenCV
-    # uses double for the scale before the sample coordinates are stored as float.
-    xs = (torch.arange(out_w, dtype=torch.float64) + 0.5) * inv_x - 0.5
-    ys = (torch.arange(out_h, dtype=torch.float64) + 0.5) * inv_y - 0.5
-    map_x = xs.to(dtype=torch.float32, device=device)
-    map_y = ys.to(dtype=torch.float32, device=device)
+    map_x, map_y = _resize_coords(in_h, in_w, out_h, out_w, image.device)
     map_x = map_x.view(1, 1, out_w).expand(image.shape[0], out_h, out_w)
     map_y = map_y.view(1, out_h, 1).expand(image.shape[0], out_h, out_w)
     return _bilinear_sample(image, map_x, map_y)
+
+
+@functools.lru_cache(maxsize=1024)
+def _resize_coords(
+    in_h: int, in_w: int, out_h: int, out_w: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Source coordinates for ``resize_bilinear``, kept on ``device``.
+
+    Cached so repeated calls (and CUDA graph capture) do no host-to-device copy.
+    Coordinates are built in float64 on CPU. MPS has no float64, and OpenCV
+    uses double for the scale before the sample coordinates are stored as float.
+    """
+    inv_x = float(in_w) / float(out_w)
+    inv_y = float(in_h) / float(out_h)
+    xs = (torch.arange(out_w, dtype=torch.float64) + 0.5) * inv_x - 0.5
+    ys = (torch.arange(out_h, dtype=torch.float64) + 0.5) * inv_y - 0.5
+    return xs.to(dtype=torch.float32, device=device), ys.to(dtype=torch.float32, device=device)
 
 
 def remap_bilinear(image: torch.Tensor, map_x: torch.Tensor, map_y: torch.Tensor) -> torch.Tensor:
