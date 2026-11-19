@@ -7,6 +7,12 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_flatten
 
 import deepflow
+from deepflow.variational import (
+    _neighbor_weights,
+    checkerboard,
+    sor_iteration,
+    sor_iteration_functional,
+)
 
 
 def _texture(height=32, width=32):
@@ -94,6 +100,40 @@ def test_estimate_touches_no_host_tensor_after_warmup():
         with watch:
             model._estimate(i0, i1)
     assert not watch.ops, sorted(watch.ops)
+
+
+def test_functional_sor_matches_in_place():
+    gen = torch.Generator().manual_seed(3)
+    shape = (2, 1, 17, 23)
+    a11, a22 = (torch.rand(shape, generator=gen) + 1.0 for _ in range(2))
+    a12, b1, b2 = (torch.randn(shape, generator=gen) * 0.1 for _ in range(3))
+    neighbors = _neighbor_weights(torch.rand(shape, generator=gen))
+    red, black = checkerboard(shape[-2], shape[-1], torch.device("cpu"))
+    start = torch.randn(2, 2, 17, 23, generator=gen)
+    expected = start.clone()
+    actual = start.clone()
+    for _ in range(3):
+        sor_iteration(expected, neighbors, a11, a12, a22, b1, b2, 1.6, red, black)
+        sor_iteration_functional(actual, neighbors, a11, a12, a22, b1, b2, 1.6, red, black)
+    assert torch.equal(actual, expected)
+
+
+_COMPILE_DEVICES = ["cpu"]
+if torch.backends.mps.is_available():
+    _COMPILE_DEVICES.append("mps")
+if torch.cuda.is_available():
+    _COMPILE_DEVICES.append("cuda")
+
+
+@pytest.mark.parametrize("device", _COMPILE_DEVICES)
+def test_compile_matches_eager(device):
+    settings = dict(device=device, fixed_point_iterations=2, sor_iterations=3, cuda_graph=False)
+    i0, i1 = _texture(40, 36)
+    eager = deepflow.DeepFlow(**settings).calc(i0, i1)
+    compiled_model = deepflow.DeepFlow(compile=True, **settings)
+    compiled = compiled_model.calc(i0, i1)
+    assert compiled_model.compile
+    torch.testing.assert_close(compiled, eager)
 
 
 def test_cuda_graph_option_is_ignored_on_cpu():

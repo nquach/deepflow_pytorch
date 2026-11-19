@@ -12,7 +12,7 @@ import torch
 
 from deepflow.io import format_flow, prepare_pair, validate_pyramid_settings
 from deepflow.ops import gaussian_blur, resize_bilinear
-from deepflow.variational import checkerboard, sor_iteration, variational_refine
+from deepflow.variational import checkerboard, sor_iteration_functional, variational_refine
 
 
 def pyramid_sizes(
@@ -76,7 +76,7 @@ def _compiled_sor_iteration() -> Callable[..., None]:
     global _COMPILED_SOR
     if _COMPILED_SOR is None:
         # dynamic=True: one compiled graph serves every pyramid level size.
-        _COMPILED_SOR = torch.compile(sor_iteration, dynamic=True, fullgraph=True)
+        _COMPILED_SOR = torch.compile(sor_iteration_functional, dynamic=True, fullgraph=True)
     return _COMPILED_SOR
 
 

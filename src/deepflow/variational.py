@@ -191,6 +191,37 @@ def sor_iteration(
     _sor_pass(inc, neighbors, a11, a12, a22, b1, b2, omega, black)
 
 
+def sor_iteration_functional(
+    inc: torch.Tensor,
+    neighbors: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    a11: torch.Tensor,
+    a12: torch.Tensor,
+    a22: torch.Tensor,
+    b1: torch.Tensor,
+    b2: torch.Tensor,
+    omega: float,
+    red: torch.Tensor,
+    black: torch.Tensor,
+) -> None:
+    """:func:`sor_iteration` for ``torch.compile``: the same arithmetic, written back once.
+
+    ``torch.compile`` cannot trace ``torch.where(..., out=du)`` into the
+    non-contiguous channel slices of ``inc``, so ``du`` and ``dv`` are updated
+    out of place and copied into ``inc`` at the end. In eager mode the extra
+    copies make this slower than :func:`sor_iteration`.
+    """
+    du = inc[:, 0:1]
+    dv = inc[:, 1:2]
+    for mask in (red, black):
+        sigma = _sigma(neighbors, torch.cat([du, dv], dim=1))
+        du_new = du + omega * ((sigma[:, 0:1] + b1 - dv * a12) / a11 - du)
+        du = torch.where(mask, du_new, du)
+        # dv at this pixel reads the just-updated du, matching the scalar loop.
+        dv_new = dv + omega * ((sigma[:, 1:2] + b2 - du * a12) / a22 - dv)
+        dv = torch.where(mask, dv_new, dv)
+    inc.copy_(torch.cat([du, dv], dim=1))
+
+
 def warp_image(image: torch.Tensor, flow_u: torch.Tensor, flow_v: torch.Tensor) -> torch.Tensor:
     """Warp ``image`` by ``(x + u, y + v)`` with bilinear sampling and replicate borders."""
     height, width = image.shape[-2:]
