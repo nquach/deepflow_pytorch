@@ -88,15 +88,47 @@ class _HostTensorWatch(TorchDispatchMode):
         return out
 
 
-def test_estimate_touches_no_host_tensor_after_warmup():
+_FAST_SOLVER = dict(fixed_point_iterations=1, sor_iterations=1, max_layers=3)
+
+
+@pytest.mark.parametrize("solver", [deepflow.DeepFlow, deepflow.DeepFlowICCV])
+def test_estimate_touches_no_host_tensor_after_warmup(solver):
     # CUDA graph capture forbids host-to-device copies, so after the first call
     # for a shape the pipeline must stay entirely on the compute device.
-    model = deepflow.DeepFlow(fixed_point_iterations=1, sor_iterations=1)
+    model = solver(**_FAST_SOLVER)
     i0 = torch.empty(2, 1, 60, 70, device="meta")
     i1 = torch.empty(2, 1, 60, 70, device="meta")
     with torch.no_grad():
         model._estimate(i0, i1)
         watch = _HostTensorWatch()
+        with watch:
+            model._estimate(i0, i1)
+    assert not watch.ops, sorted(watch.ops)
+
+
+class _HostSyncWatch(TorchDispatchMode):
+    _SYNCS = {"aten.nonzero.default", "aten._local_scalar_dense.default", "aten.item.default"}
+
+    def __init__(self):
+        super().__init__()
+        self.ops = set()
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if str(func) in self._SYNCS:
+            self.ops.add(str(func))
+        return func(*args, **(kwargs or {}))
+
+
+@pytest.mark.parametrize("solver", [deepflow.DeepFlow, deepflow.DeepFlowICCV])
+def test_estimate_reads_no_value_back_to_the_host(solver):
+    # Real values (the meta device has none) so data-dependent ops such as
+    # torch.where(mask) would run and be caught. They stall a GPU and cannot be
+    # recorded in a CUDA graph.
+    i0, i1 = (torch.from_numpy(image).float()[None, None] for image in _smooth_pair(40, 44))
+    model = solver(**_FAST_SOLVER)
+    with torch.no_grad():
+        model._estimate(i0, i1)
+        watch = _HostSyncWatch()
         with watch:
             model._estimate(i0, i1)
     assert not watch.ops, sorted(watch.ops)
@@ -136,10 +168,22 @@ def test_compile_matches_eager(device):
     torch.testing.assert_close(compiled, eager)
 
 
-def test_cuda_graph_option_is_ignored_on_cpu():
+@pytest.mark.parametrize("device", _COMPILE_DEVICES)
+def test_iccv_compile_matches_eager(device):
+    settings = dict(device=device, fixed_point_iterations=2, sor_iterations=3, cuda_graph=False)
+    i0, i1 = _smooth_pair()
+    eager = deepflow.DeepFlowICCV(**settings).calc(i0, i1)
+    compiled = deepflow.DeepFlowICCV(compile=True, **settings).calc(i0, i1)
+    # The matching term can amplify one-ulp rounding changes from fused kernels.
+    mean = _mean_abs(compiled, eager)
+    assert mean < 1e-3, f"compiled vs eager mean abs {mean}"
+
+
+@pytest.mark.parametrize("solver", [deepflow.DeepFlow, deepflow.DeepFlowICCV])
+def test_cuda_graph_option_is_ignored_on_cpu(solver):
     i0, i1 = _texture()
-    plain = deepflow.DeepFlow(device="cpu").calc(i0, i1)
-    graphed = deepflow.DeepFlow(device="cpu", cuda_graph=True).calc(i0, i1)
+    plain = solver(device="cpu", **_FAST_SOLVER).calc(i0, i1)
+    graphed = solver(device="cpu", cuda_graph=True, **_FAST_SOLVER).calc(i0, i1)
     assert np.array_equal(plain, graphed)
 
 
@@ -173,3 +217,27 @@ def test_cuda_graph_captures_each_shape():
     batch1 = torch.roll(batch0, 1, dims=-1)
     assert torch.allclose(model.calc(batch0, batch1), eager.calc(batch0, batch1), atol=1e-6)
     assert len(model._graphs) == 3
+
+
+def test_iccv_cuda_graph_matches_eager_and_tracks_shape_and_settings():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    graphed = deepflow.DeepFlowICCV(device="cuda", cuda_graph=True)
+    eager = deepflow.DeepFlowICCV(device="cuda", cuda_graph=False)
+    first = _smooth_pair()
+    rng = np.random.RandomState(9)
+    other = (rng.rand(28, 28) * 255).astype(np.float32)
+    second = (other, np.roll(other, 2, axis=1))
+    for pair in (first, second):
+        assert np.abs(graphed.calc(*pair) - eager.calc(*pair)).max() < 1e-6
+    assert len(graphed._graphs) == 1
+    assert not graphed._graph_failed
+
+    third = _smooth_pair(32, 36)
+    assert np.abs(graphed.calc(*third) - eager.calc(*third)).max() < 1e-6
+    assert len(graphed._graphs) == 2
+
+    # A changed setting must not replay a graph recorded with the old one.
+    graphed.beta = eager.beta = 50.0
+    assert np.abs(graphed.calc(*first) - eager.calc(*first)).max() < 1e-6
+    assert len(graphed._graphs) == 3

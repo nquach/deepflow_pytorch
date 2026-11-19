@@ -506,25 +506,27 @@ def _paint(
     height: int,
     width: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Centers are 2, 6, 10, ... and patch i spans pixels 4i .. 4i+3, so windows
+    # tile the image without overlap and pixel p belongs to patch p // 4. Pixels
+    # past the last window stay 0. A dense lookup avoids the host sync that
+    # ``torch.where(keep)`` needs, so this can run inside a CUDA graph.
     device = target_y.device
-    u = torch.zeros(1, 1, height, width, dtype=torch.float32, device=device)
-    v = torch.zeros_like(u)
-    mask = torch.zeros_like(u)
-    rows, cols = torch.where(keep)
-    if rows.numel() == 0:
-        return u, v, mask
-    cy = centers_y[rows]
-    cx = centers_x[cols]
-    du = (target_x[rows, cols] - cx).to(dtype=u.dtype)
-    dv = (target_y[rows, cols] - cy).to(dtype=u.dtype)
-    for oy in range(-2, 2):
-        for ox in range(-2, 2):
-            yy = (cy + oy).clamp(0, height - 1)
-            xx = (cx + ox).clamp(0, width - 1)
-            u[0, 0, yy, xx] = du
-            v[0, 0, yy, xx] = dv
-            mask[0, 0, yy, xx] = 1
-    return u, v, mask
+    gy, gx = keep.shape
+    du = (target_x - centers_x.view(1, gx)).to(dtype=torch.float32)
+    dv = (target_y - centers_y.view(gy, 1)).to(dtype=torch.float32)
+    ys = torch.arange(height, device=device)
+    xs = torch.arange(width, device=device)
+    rows = torch.div(ys, 4, rounding_mode="floor").view(height, 1)
+    cols = torch.div(xs, 4, rounding_mode="floor").view(1, width)
+    covered = (rows < gy) & (cols < gx)
+    rows = rows.clamp(max=gy - 1)
+    cols = cols.clamp(max=gx - 1)
+    painted = keep[rows, cols] & covered
+    zero = torch.zeros((), dtype=torch.float32, device=device)
+    u = torch.where(painted, du[rows, cols], zero)
+    v = torch.where(painted, dv[rows, cols], zero)
+    mask = painted.to(dtype=torch.float32)
+    return u.view(1, 1, height, width), v.view(1, 1, height, width), mask.view(1, 1, height, width)
 
 
 def _confidence(

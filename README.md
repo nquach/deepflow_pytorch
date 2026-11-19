@@ -95,7 +95,7 @@ At the default scale of 0.95 a 1080p pair has on the order of 70 levels, and eac
 
 ## Performance
 
-That iteration count means roughly half a million small kernels per frame. Most levels are tiny, so in plain eager mode a GPU spends its time on launch overhead rather than arithmetic. Two constructor options address that:
+That iteration count means roughly half a million small kernels per frame. Most levels are tiny, so in plain eager mode a GPU spends its time on launch overhead rather than arithmetic. `DeepFlow` and `DeepFlowICCV` both take two constructor options that address that:
 
 | Option | Default | Effect |
 | --- | --- | --- |
@@ -107,6 +107,8 @@ model = deepflow.DeepFlow(device="cuda", compile=True)  # cuda_graph is on by de
 for frame0, frame1 in pairs:          # same resolution: captured once, replayed after
     flow = model.calc(frame0, frame1)
 ```
+
+For `DeepFlowICCV` the CUDA graph also covers DeepMatching, so one replay runs the whole pipeline. Changing a field after the first call records a new graph rather than replaying a stale one. With `compile=True`, expect ICCV results to drift further from eager mode than DeepFlow's do: the matching term can amplify one-ulp rounding changes from fused kernels.
 
 Batching several pairs into one `(N, 1, H, W)` call is the other lever: the coarse levels are too small to fill a GPU with a single pair. Time your setup with:
 
